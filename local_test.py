@@ -10,22 +10,43 @@ from validator.modules.rl import RLValidationModule, RLConfig, RLInputData
 
 
 @click.command()
-@click.option('--local-model-path', required=True, type=str, help='本地 ONNX 模型文件路径')
+@click.option('--local-model-path', required=False, type=str, default=None, help='本地 ONNX 模型文件路径')
+@click.option('--hf-repo-id', required=False, type=str, default=None, help='HuggingFace 仓库 ID (如: username/model-name)')
+@click.option('--hf-revision', required=False, type=str, default='main', help='HuggingFace commit hash 或分支名')
+@click.option('--hf-filename', required=False, type=str, default='model.onnx', help='HuggingFace 模型文件名')
 @click.option('--local-data-path', required=True, type=str, help='本地测试数据文件路径 (.npz)')
 @click.option('--batch-size', default=512, type=int, help='批处理大小')
 @click.option('--seed', default=42, type=int, help='随机种子')
 @click.option('--max-params', default=None, type=int, help='模型参数上限（可选）')
-def main(local_model_path: str, local_data_path: str, batch_size: int, seed: int, max_params: int):
+def main(local_model_path: str, hf_repo_id: str, hf_revision: str, hf_filename: str,
+         local_data_path: str, batch_size: int, seed: int, max_params: int):
     """
     本地测试 RL 模型验证
 
     示例:
+        # 使用本地模型
         python local_test.py --local-model-path /path/to/model.onnx --local-data-path /path/to/test.npz
+
+        # 从 HuggingFace 下载模型（使用特定 commit hash）
+        python local_test.py --hf-repo-id username/model-name --hf-revision a32ae4a4ad36ca92c19877ba2ee0d9bb6a155850 --local-data-path /path/to/test.npz
     """
+    # 验证参数：必须提供 local-model-path 或 hf-repo-id 其中之一
+    if not local_model_path and not hf_repo_id:
+        raise click.UsageError("必须提供 --local-model-path 或 --hf-repo-id 其中之一")
+    if local_model_path and hf_repo_id:
+        raise click.UsageError("--local-model-path 和 --hf-repo-id 不能同时使用")
+
     print("=" * 60)
     print("本地测试模式")
     print("=" * 60)
-    print(f"模型路径: {local_model_path}")
+    if local_model_path:
+        print(f"模型来源: 本地文件")
+        print(f"模型路径: {local_model_path}")
+    else:
+        print(f"模型来源: HuggingFace")
+        print(f"仓库 ID: {hf_repo_id}")
+        print(f"Revision: {hf_revision}")
+        print(f"文件名: {hf_filename}")
     print(f"数据路径: {local_data_path}")
     print(f"批处理大小: {batch_size}")
     print(f"随机种子: {seed}")
@@ -37,13 +58,13 @@ def main(local_model_path: str, local_data_path: str, batch_size: int, seed: int
     # 创建验证模块
     module = RLValidationModule(config)
 
-    # 加载本地模型
+    # 加载模型
     print("\n[1/3] 加载模型...")
     try:
         model = module._load_model(
-            repo_id="",  # 不使用
-            filename="",  # 不使用
-            revision="",  # 不使用
+            repo_id=hf_repo_id or "",
+            filename=hf_filename,
+            revision=hf_revision,
             max_params=max_params,
             local_model_path=local_model_path
         )
