@@ -63,6 +63,14 @@ class RLValidationModule(BaseValidationModule):
         else:
             # 从 HuggingFace 下载
             model_path = hf_hub_download(repo_id, filename, revision=revision)
+            # 尝试下载外部数据文件（如果存在）
+            external_data_filename = filename + ".data"
+            try:
+                hf_hub_download(repo_id, external_data_filename, revision=revision)
+                print(f"Downloaded external data file: {external_data_filename}")
+            except Exception:
+                # 外部数据文件不存在，忽略
+                pass
 
         # Check parameter count
         onnx_model = onnx.load(model_path)
