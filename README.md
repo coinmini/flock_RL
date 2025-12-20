@@ -32,7 +32,7 @@ python run.py \
 ```
 
 #### Arguments and Options
-- `<module>`: Name of the validation module to use (e.g., `lora`).
+- `<module>`: Name of the validation module to use (e.g., `rl`).
 - `--task_ids`: Comma-separated list of task IDs to validate.
 - `--flock-api-key`: Flock API key (can also be set via the `FLOCK_API_KEY` environment variable).
 - `--hf-token`: HuggingFace token (can also be set via the `HF_TOKEN` environment variable).
@@ -43,7 +43,7 @@ python run.py \
 #### Example
 
 ```bash
-python run.py lora --task_ids 123,456 --flock-api-key $FLOCK_API_KEY --hf-token $HF_TOKEN
+python run.py rl --task_ids 123,456 --flock-api-key $FLOCK_API_KEY --hf-token $HF_TOKEN
 ```
 
 ### Environment Variables
