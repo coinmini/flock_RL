@@ -17,10 +17,11 @@ def _split_info(Info: np.ndarray):
 
     cols = [start + 4 * j + k for j in range(V) for k in range(4)]
     block = Info[:, cols].astype(np.float32).reshape(N, V, 4)
-    fill_rate = np.clip(block[:, :, 0], 0.0, 1.0)
-    rebate_bps = block[:, :, 1]
-    punish = block[:, :, 2]
-    latest_vol = np.maximum(block[:, :, 3], 0.0)
+    # Actual data order: [latest_vol, fill_rate, rebate_bps, punish]
+    latest_vol = np.maximum(block[:, :, 0], 0.0)
+    fill_rate = np.clip(block[:, :, 1], 0.0, 1.0)
+    rebate_bps = block[:, :, 2]
+    punish = block[:, :, 3]
 
     return {
         "qty": qty,

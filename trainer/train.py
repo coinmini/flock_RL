@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import sys
 import time
 import numpy as np
 import torch
@@ -8,9 +9,14 @@ import requests
 import json
 from torch.utils.data import Dataset, DataLoader
 from typing import Tuple, Dict
+from dotenv import load_dotenv
+
+load_dotenv()
 
 FED_LEDGER_BASE_URL = "https://fed-ledger-prod.flock.io/api/v1"
 FLOCK_API_KEY = os.environ.get("FLOCK_API_KEY")
+HF_TOKEN = os.environ.get("HF_TOKEN")
+TASK_ID = os.environ.get("TASK_ID")
 
 class MLP(nn.Module):
     """Simple Multi-Layer Perceptron"""
@@ -46,19 +52,19 @@ class SimpleDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-def load_data(data_dir: str = "data"):
+def load_data(data_file: str):
     """
-    Load training data from .npy files
+    Load training data from .npz file
 
     Args:
-        data_dir: Directory containing the data files
+        data_file: Path to the .npz data file
 
     Returns:
         X_train, Info_train
     """
-    print(f"Loading data from {data_dir}...")
+    print(f"Loading data from {data_file}...")
 
-    data = np.load(os.path.join(data_dir, "train.npz"))
+    data = np.load(data_file)
     X_train, Info_train = data['X'], data['Info']
 
     print(f"X_train shape: {X_train.shape}")
@@ -69,25 +75,75 @@ def load_data(data_dir: str = "data"):
 
 def prepare_labels(Info: np.ndarray) -> np.ndarray:
     """
-    Create labels from Info array.
-    For this example, we'll create a dummy target with the same number of dimensions
-    as the expected action space (V venues).
-    
+    Create labels from Info array using heuristic optimal allocation.
+
+    The reward function in env.py is:
+        reward = (rebate_bps/10000 * filled + punish * unfilled).sum() / log1p(qty)
+
+    Where:
+        - filled = min(alloc, capacity)
+        - capacity = latest_vol * cap_window * fill_rate
+        - cap_window = 1.0 + 0.6 * (1 - exp(-0.9 * duration))
+        - unfilled = alloc - filled (punish is negative, so this reduces reward)
+
+    Optimal strategy: allocate to venues where we can fill AND get good rebates,
+    while avoiding venues where we'd have unfilled orders (penalty).
+
     The environment infers V from Info columns: V = (cols - 3) // 4
+    Each venue has 4 columns: [fill_rate, rebate_bps, punish, latest_vol]
     """
-    # Infer V (number of venues)
+    N = Info.shape[0]
     m = Info.shape[1]
     start = 3
     V = (m - start) // 4
-    
-    # Create dummy targets of shape (N, V)
-    labels = Info[:, start:start+V].astype(np.float32) 
-    
-    return labels
+
+    qty = Info[:, 0].astype(np.float32)        # shape: (N,)
+    duration = Info[:, 1].astype(np.float32)   # shape: (N,)
+
+    # Extract per-venue data
+    cols = [start + 4 * j + k for j in range(V) for k in range(4)]
+    block = Info[:, cols].astype(np.float32).reshape(N, V, 4)
+
+    # Actual data order: [latest_vol, fill_rate, rebate_bps, punish]
+    latest_vol = np.maximum(block[:, :, 0], 0.0)     # shape: (N, V)
+    fill_rate = np.clip(block[:, :, 1], 0.0, 1.0)   # shape: (N, V)
+    rebate_bps = block[:, :, 2]                      # shape: (N, V)
+    punish = block[:, :, 3]                          # shape: (N, V) - negative values
+
+    # Compute capacity exactly as in env.py
+    cap_window = 1.0 + 0.6 * (1.0 - np.exp(-0.9 * duration))  # shape: (N,)
+    capacity = latest_vol * cap_window[:, None] * fill_rate   # shape: (N, V)
+
+    # Score each venue by expected reward contribution
+    # If we allocate x to a venue:
+    #   - If x <= capacity: reward = rebate_bps/10000 * x (positive)
+    #   - If x > capacity: reward = rebate_bps/10000 * capacity + punish * (x - capacity)
+    #                      The unfilled part gets punished (punish is negative)
+
+    # Heuristic: prioritize venues with high (rebate * capacity) and low punish
+    # We want to allocate proportionally to capacity, but weighted by rebate/punish ratio
+
+    rebate_per_unit = rebate_bps / 10000.0  # Convert bps to decimal
+
+    # Expected value per unit allocated (assuming we stay within capacity)
+    # Higher rebate = better, lower (more negative) punish = worse if we exceed capacity
+    # Score = capacity * rebate - (we don't want to exceed capacity, so weight by capacity)
+
+    # Simple approach: allocate proportionally to capacity, weighted by rebate attractiveness
+    # Venues with higher capacity AND higher rebates should get more allocation
+    score = capacity * (rebate_per_unit - punish)  # punish is negative, so -punish is positive
+
+    # Ensure non-negative scores
+    score = np.maximum(score, 1e-8)
+
+    # Normalize to get allocation probabilities
+    labels = score / score.sum(axis=1, keepdims=True)
+
+    return labels.astype(np.float32)
 
 
 def train_mlp(
-    data_dir: str = "data",
+    data_file: str,
     output_dir: str = "runs",
     model_name: str = "mlp_example",
     hidden: Tuple[int, ...] = (256, 256),
@@ -103,7 +159,7 @@ def train_mlp(
     Train a MLP model
 
     Args:
-        data_dir: Directory containing training data
+        data_file: Path to the .npz training data file
         output_dir: Directory to save model outputs
         model_name: Name for the saved model
         hidden: Hidden layer dimensions
@@ -128,7 +184,7 @@ def train_mlp(
     print(f"Using device: {device}")
 
     # Load data
-    X_all, Info_all = load_data(data_dir)
+    X_all, Info_all = load_data(data_file)
 
     # Prepare labels
     y_all = prepare_labels(Info_all)
@@ -182,6 +238,13 @@ def train_mlp(
         "val_loss": [],
         "train_time": [],
     }
+
+    # Early stopping variables
+    best_val_loss = float('inf')
+    best_model_state = None
+    best_epoch = 0
+    patience = 20  # Stop if no improvement for 20 epochs
+    patience_counter = 0
 
     print("\nStarting training...")
     total_start = time.time()
@@ -238,17 +301,39 @@ def train_mlp(
         log["val_loss"].append(avg_val_loss)
         log["train_time"].append(epoch_time)
 
+        # Early stopping check
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_epoch = epoch
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
         # Print progress
         if epoch % 10 == 0 or epoch == 1:
             print(
                 f"[Epoch {epoch:4d}/{epochs}] "
                 f"Train Loss: {avg_train_loss:.6f} | "
                 f"Val Loss: {avg_val_loss:.6f} | "
+                f"Best: {best_val_loss:.6f} (ep {best_epoch}) | "
                 f"Time: {epoch_time:.2f}s"
             )
 
+        # Early stopping
+        if patience_counter >= patience:
+            print(f"\nEarly stopping at epoch {epoch}. Best epoch was {best_epoch}.")
+            break
+
     total_time = time.time() - total_start
     print(f"\nTraining completed in {total_time:.2f}s")
+    print(f"Best validation loss: {best_val_loss:.6f} at epoch {best_epoch}")
+
+    # Restore best model
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        model = model.to(device)
+        print(f"Restored best model from epoch {best_epoch}")
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -272,7 +357,7 @@ def train_mlp(
         input_names=["input"],
         output_names=["output"],
         dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
-        opset_version=11,
+        opset_version=18,
         do_constant_folding=True,
     )
     print(f"Saved ONNX model to {onnx_path}")
@@ -286,16 +371,16 @@ def train_mlp(
 
 
 def upload_to_huggingface(
-    model_path: str,
+    folder_path: str,
     repo_id: str,
     token: str = None,
     commit_message: str = "Upload model",
 ):
     """
-    Upload model to Hugging Face Hub
+    Upload folder to Hugging Face Hub
 
     Args:
-        model_path: Path to the model file to upload
+        folder_path: Path to the folder to upload
         repo_id: Hugging Face repository ID (e.g., "username/model-name")
         token: Hugging Face API token (or set HF_TOKEN environment variable)
         commit_message: Commit message for the upload
@@ -308,16 +393,16 @@ def upload_to_huggingface(
         )
         return
 
-    print("\nUploading model to Hugging Face...")
+    print("\nUploading folder to Hugging Face...")
     print(f"Repository: {repo_id}")
-    print(f"Model path: {model_path}")
+    print(f"Folder path: {folder_path}")
 
     # Get token from environment if not provided
     if token is None:
-        token = os.environ.get("HF_TOKEN")
+        token = HF_TOKEN
         if token is None:
             print(
-                "Error: No Hugging Face token provided. Set HF_TOKEN environment variable or pass token parameter."
+                "Error: No Hugging Face token provided. Set HF_TOKEN in .env file or pass token parameter."
             )
             return
 
@@ -332,15 +417,14 @@ def upload_to_huggingface(
         except Exception as e:
             print(f"Note: {e}")
 
-        # Upload file
-        commit_message = api.upload_file(
-            path_or_fileobj=model_path,
-            path_in_repo=os.path.basename(model_path),
+        # Upload folder
+        commit_info = api.upload_folder(
+            folder_path=folder_path,
             repo_id=repo_id,
             token=token,
             commit_message=commit_message,
         )
-        commit_hash = commit_message.oid
+        commit_hash = commit_info.oid
 
         print(f"Successfully uploaded to https://huggingface.co/{repo_id}")
         return commit_hash
@@ -380,18 +464,28 @@ def submit_task(
 
 
 if __name__ == "__main__":
+    # Parse command line argument for training data file
+    if len(sys.argv) < 2:
+        print("Usage: python train.py <data_file>")
+        print("Example: python train.py data/train.npz")
+        sys.exit(1)
+
+    data_file = sys.argv[1]
+    if not os.path.exists(data_file):
+        raise FileNotFoundError(f"Training data file not found: {data_file}")
+
     print("=" * 70)
     print("RL TRAINING AND VALIDATION EXAMPLE")
     print("=" * 70)
+    print(f"Training data file: {data_file}")
 
-    task_id = os.environ.get("TASK_ID")
-    if task_id is None:
-        raise Exception("TASK_ID environment variable is not set")
+    if TASK_ID is None:
+        raise Exception("TASK_ID is not set in .env file")
 
     # STEP 1: TRAINER - Train the model
     print("\n[Step 1] Training model...")
     log = train_mlp(
-        data_dir="data",
+        data_file=data_file,
         output_dir="runs",
         model_name="mlp_example",
         hidden=(256, 256),
@@ -403,29 +497,3 @@ if __name__ == "__main__":
         seed=42,
     )
     print("[Step 1] ✓ Training complete!")
-
-    # STEP 2: TRAINER - Upload model to HuggingFace
-    print("\n[Step 2] Uploading model to HuggingFace...")
-    # Define model info that will be used later in validation
-    model_repo_id = "your-username/mlp-example"  # Change to your repo
-    model_filename = "mlp_example.onnx"
-
-    commit_hash = upload_to_huggingface(
-        model_path="runs/mlp_example.onnx",
-        repo_id=model_repo_id,
-        token=None,  # Will use HF_TOKEN environment variable
-        commit_message="Upload trained MLP model",
-    )
-    print("[Step 2] ✓ Model uploaded to HuggingFace!")
-
-    # STEP 3: VALIDATOR - Get submission to validate from backend
-    print("\n[Step 3] Submit model to fed ledger")
-
-    submit_task(
-        task_id=task_id,
-        hg_repo_id=model_repo_id,
-        model_filename=model_filename,
-        revision=commit_hash,
-    )
-
-    print("[Step 3] ✓ Model submitted to fed ledger!")
